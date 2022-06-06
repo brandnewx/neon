@@ -58,7 +58,7 @@ lazy_static! {
     static ref NEXT_THREAD_ID: AtomicU64 = AtomicU64::new(1);
 
     /// Global registry of threads
-    static ref THREADS: Mutex<HashMap<u64, Arc<PageServerThread>>> = Mutex::new(HashMap::new());
+    static ref THREADS: Mutex<HashMap<u64, Arc<Mutex<PageServerThread>>>> = Mutex::new(HashMap::new());
 }
 
 // There is a Tokio watch channel for each thread, which can be used to signal the
@@ -68,7 +68,7 @@ lazy_static! {
 thread_local!(static SHUTDOWN_RX: RefCell<Option<watch::Receiver<()>>> = RefCell::new(None));
 
 // Each thread holds reference to its own PageServerThread here.
-thread_local!(static CURRENT_THREAD: RefCell<Option<Arc<PageServerThread>>> = RefCell::new(None));
+thread_local!(static CURRENT_THREAD: RefCell<Option<Arc<Mutex<PageServerThread>>>> = RefCell::new(None));
 
 ///
 /// There are many kinds of threads in the system. Some are associated with a particular
@@ -126,7 +126,7 @@ struct PageServerThread {
 
     /// Handle for waiting for the thread to exit. It can be None, if the
     /// the thread has already exited.
-    join_handle: Mutex<Option<JoinHandle<()>>>,
+    join_handle: Option<JoinHandle<()>>,
 }
 
 /// Launch a new thread
@@ -145,7 +145,7 @@ where
 {
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let thread_id = NEXT_THREAD_ID.fetch_add(1, Ordering::Relaxed);
-    let thread = PageServerThread {
+    let thread = Arc::new(Mutex::new(PageServerThread {
         _thread_id: thread_id,
         kind,
         tenant_id,
@@ -155,19 +155,17 @@ where
         shutdown_requested: AtomicBool::new(false),
         shutdown_tx,
 
-        join_handle: Mutex::new(None),
-    };
+        join_handle: None,
+    }));
 
-    let thread_rc = Arc::new(thread);
-
-    let mut jh_guard = thread_rc.join_handle.lock().unwrap();
+    let mut thread_guard = thread.lock().unwrap();
 
     THREADS
         .lock()
         .unwrap()
-        .insert(thread_id, Arc::clone(&thread_rc));
+        .insert(thread_id, Arc::clone(&thread));
 
-    let thread_rc2 = Arc::clone(&thread_rc);
+    let thread_cloned = Arc::clone(&thread);
     let thread_name = name.to_string();
     let join_handle = match thread::Builder::new()
         .name(name.to_string())
@@ -175,7 +173,7 @@ where
             thread_wrapper(
                 thread_name,
                 thread_id,
-                thread_rc2,
+                thread_cloned,
                 shutdown_rx,
                 shutdown_process_on_error,
                 f,
@@ -189,8 +187,8 @@ where
             return Err(err);
         }
     };
-    *jh_guard = Some(join_handle);
-    drop(jh_guard);
+    thread_guard.join_handle = Some(join_handle);
+    drop(thread_guard);
 
     // The thread is now running. Nothing more to do here
     Ok(thread_id)
@@ -201,7 +199,7 @@ where
 fn thread_wrapper<F>(
     thread_name: String,
     thread_id: u64,
-    thread: Arc<PageServerThread>,
+    thread: Arc<Mutex<PageServerThread>>,
     shutdown_rx: watch::Receiver<()>,
     shutdown_process_on_error: bool,
     f: F,
@@ -229,19 +227,20 @@ fn thread_wrapper<F>(
         .remove(&thread_id)
         .expect("no thread in registry");
 
+    let thread_guard = thread.lock().unwrap();
     match result {
         Ok(Ok(())) => debug!("Thread '{}' exited normally", thread_name),
         Ok(Err(err)) => {
             if shutdown_process_on_error {
                 error!(
                     "Shutting down: thread '{}' tenant_id: {:?}, timeline_id: {:?} exited with error: {:?}",
-                    thread_name, thread.tenant_id, thread.timeline_id, err
+                    thread_name, thread_guard.tenant_id, thread_guard.timeline_id, err
                 );
                 shutdown_pageserver(1);
             } else {
                 error!(
                     "Thread '{}' tenant_id: {:?}, timeline_id: {:?} exited with error: {:?}",
-                    thread_name, thread.tenant_id, thread.timeline_id, err
+                    thread_name, thread_guard.tenant_id, thread_guard.timeline_id, err
                 );
             }
         }
@@ -249,17 +248,28 @@ fn thread_wrapper<F>(
             if shutdown_process_on_error {
                 error!(
                     "Shutting down: thread '{}' tenant_id: {:?}, timeline_id: {:?} panicked: {:?}",
-                    thread_name, thread.tenant_id, thread.timeline_id, err
+                    thread_name, thread_guard.tenant_id, thread_guard.timeline_id, err
                 );
                 shutdown_pageserver(1);
             } else {
+                let thread_guard = thread.lock().unwrap();
                 error!(
                     "Thread '{}' tenant_id: {:?}, timeline_id: {:?} panicked: {:?}",
-                    thread_name, thread.tenant_id, thread.timeline_id, err
+                    thread_name, thread_guard.tenant_id, thread_guard.timeline_id, err
                 );
             }
         }
     }
+}
+
+// expected to be called from the thread of the given id.
+pub fn associate_with(tenant_id: Option<ZTenantId>, timeline_id: Option<ZTimelineId>) {
+    CURRENT_THREAD.with(|ct| {
+        let borrowed = ct.borrow();
+        let mut thread_guard = borrowed.as_ref().unwrap().lock().unwrap();
+        thread_guard.tenant_id = tenant_id;
+        thread_guard.timeline_id = timeline_id;
+    });
 }
 
 /// Is there a thread running that matches the criteria
@@ -285,21 +295,26 @@ pub fn shutdown_threads(
 
     let threads = THREADS.lock().unwrap();
     for thread in threads.values() {
-        if (kind.is_none() || Some(thread.kind) == kind)
-            && (tenant_id.is_none() || thread.tenant_id == tenant_id)
-            && (timeline_id.is_none() || thread.timeline_id == timeline_id)
+        let thread_guard = thread.lock().unwrap();
+        if (kind.is_none() || Some(thread_guard.kind) == kind)
+            && (tenant_id.is_none() || thread_guard.tenant_id == tenant_id)
+            && (timeline_id.is_none() || thread_guard.timeline_id == timeline_id)
         {
-            thread.shutdown_requested.store(true, Ordering::Relaxed);
+            thread_guard
+                .shutdown_requested
+                .store(true, Ordering::Relaxed);
             // FIXME: handle error?
-            let _ = thread.shutdown_tx.send(());
+            let _ = thread_guard.shutdown_tx.send(());
             victim_threads.push(Arc::clone(thread));
         }
     }
     drop(threads);
 
     for thread in victim_threads {
-        info!("waiting for {} to shut down", thread.name);
-        if let Some(join_handle) = thread.join_handle.lock().unwrap().take() {
+        let mut thread_guard = thread.lock().unwrap();
+        info!("waiting for {} to shut down", thread_guard.name);
+        if let Some(join_handle) = thread_guard.join_handle.take() {
+            drop(thread_guard);
             let _ = join_handle.join();
         } else {
             // The thread had not even fully started yet. Or it was shut down
@@ -326,7 +341,10 @@ pub async fn shutdown_watcher() {
 pub fn is_shutdown_requested() -> bool {
     CURRENT_THREAD.with(|ct| {
         if let Some(ct) = ct.borrow().as_ref() {
-            ct.shutdown_requested.load(Ordering::Relaxed)
+            ct.lock()
+                .unwrap()
+                .shutdown_requested
+                .load(Ordering::Relaxed)
         } else {
             if !cfg!(test) {
                 warn!("is_shutdown_requested() called in an unexpected thread");
